@@ -198,6 +198,8 @@ const grokProvider: Provider = {
   },
 };
 
+export const GROK_READ_ONLY_DISALLOWED_TOOLS = "search_replace,run_terminal_cmd,Agent";
+
 const PI_DEFAULT_TIMEOUT_MS = 180_000;
 
 const piProvider: Provider = {
@@ -903,7 +905,7 @@ async function runGrokJson(
       args.push("-m", model);
     }
     if (readOnly) {
-      args.push("--disallowed-tools", "search_replace,run_terminal_cmd,Agent");
+      args.push("--disallowed-tools", GROK_READ_ONLY_DISALLOWED_TOOLS);
     }
     const result = await runCommandArgs("grok", args, root, undefined, { trimOutput: false });
     if (result.exitCode !== 0) {
@@ -954,7 +956,7 @@ cat > ${outputPath} << 'JSON_EOF'
 JSON_EOF`;
 }
 
-function grokEnvelopeText(value: unknown): string | null {
+export function grokEnvelopeText(value: unknown): string | null {
   if (typeof value === "string") {
     return value;
   }
@@ -1091,6 +1093,17 @@ export function tryParseGrokStdout(raw: string): unknown | null {
     for (let i = candidates.length - 1; i >= 0; i -= 1) {
       if (isPlausibleGrokResult(candidates[i])) {
         return candidates[i];
+      }
+    }
+    const rootKeys = ["findings", "summary", "outcome"];
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      const candidate = candidates[i];
+      if (
+        typeof candidate === "object" &&
+        candidate !== null &&
+        rootKeys.some((key) => key in candidate)
+      ) {
+        return candidate;
       }
     }
     if (candidates.length > 0) {
