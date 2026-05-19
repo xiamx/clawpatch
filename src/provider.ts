@@ -1,6 +1,7 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { jsonrepair } from "jsonrepair";
 import { runCommandArgs } from "./exec.js";
 import { ClawpatchError } from "./errors.js";
 import {
@@ -17,6 +18,7 @@ import {
   ReviewOutput,
   RevalidateOutput,
   agentMapOutputSchema,
+  findingCategories,
   fixPlanOutputSchema,
   reviewOutputSchema,
   revalidateOutputSchema,
@@ -195,6 +197,8 @@ const grokProvider: Provider = {
     return revalidateOutputSchema.parse(output);
   },
 };
+
+export const GROK_READ_ONLY_DISALLOWED_TOOLS = "search_replace,run_terminal_cmd,Agent";
 
 const PI_DEFAULT_TIMEOUT_MS = 180_000;
 
@@ -880,10 +884,13 @@ async function runGrokJson(
   readOnly: boolean,
 ): Promise<unknown> {
   const dir = await mkdtemp(join(tmpdir(), "clawpatch-grok-"));
-  const promptPath = join(dir, "prompt.txt");
-  await writeFile(promptPath, grokPrompt(prompt, schema), "utf8");
-
+  await chmod(dir, 0o700);
   try {
+    const promptPath = join(dir, "prompt.txt");
+    const outputPath = join(dir, "result.json");
+    await writeFile(outputPath, "", "utf8");
+    await writeFile(promptPath, grokPrompt(prompt, schema, outputPath), "utf8");
+
     const args = [
       "--prompt-file",
       promptPath,
@@ -898,7 +905,7 @@ async function runGrokJson(
       args.push("-m", model);
     }
     if (readOnly) {
-      args.push("--disallowed-tools", "search_replace,run_terminal_cmd,Agent");
+      args.push("--disallowed-tools", GROK_READ_ONLY_DISALLOWED_TOOLS);
     }
     const result = await runCommandArgs("grok", args, root, undefined, { trimOutput: false });
     if (result.exitCode !== 0) {
@@ -919,27 +926,37 @@ async function runGrokJson(
         "malformed-output",
       );
     }
-    const text = grokEnvelopeText(envelope);
-    const parsed = text === null ? envelope : extractJson(text);
+    let parsed = await readGrokOutputFile(outputPath);
+    if (parsed === null) {
+      parsed = parseGrokEnvelope(envelope);
+    }
     if (parsed === null) {
       throw new ClawpatchError("grok provider produced unparsable JSON", 8, "malformed-output");
     }
-    return parsed;
+    return normalizeGrokOutput(parsed);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-function grokPrompt(prompt: string, schema: object): string {
+function grokPrompt(prompt: string, schema: object, outputPath: string): string {
   return `${prompt}
 
 Provider output schema:
 ${JSON.stringify(schema, null, 2)}
 
-Return only one JSON object matching the schema.`;
+Return only one JSON object matching the schema.
+
+As your final action, overwrite this file with exactly the same JSON object and nothing else:
+${outputPath}
+
+Use:
+cat > ${outputPath} << 'JSON_EOF'
+{ ... the exact JSON object for this task ... }
+JSON_EOF`;
 }
 
-function grokEnvelopeText(value: unknown): string | null {
+export function grokEnvelopeText(value: unknown): string | null {
   if (typeof value === "string") {
     return value;
   }
@@ -968,8 +985,353 @@ function grokEnvelopeText(value: unknown): string | null {
   return null;
 }
 
+async function readGrokOutputFile(outputPath: string): Promise<unknown | null> {
+  const raw = (await readFile(outputPath, "utf8").catch(() => "")).trim();
+  if (raw.length === 0) {
+    return null;
+  }
+  try {
+    return JSON.parse(jsonrepair(raw)) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function parseGrokEnvelope(envelope: unknown): unknown | null {
+  const text = grokEnvelopeText(envelope);
+  if (text === null) {
+    return isPlausibleGrokResult(envelope) ? envelope : null;
+  }
+  return tryParseGrokStdout(text);
+}
+
+export function isPlausibleGrokResult(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const output = value as Record<string, unknown>;
+  if (Array.isArray(output["findings"])) {
+    return typeof output["inspected"] === "object" && output["inspected"] !== null;
+  }
+  return typeof output["summary"] === "string" || typeof output["outcome"] === "string";
+}
+
+export function extractLastJson(text: string): unknown | null {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {}
+
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/u);
+  if (fenceMatch?.[1] !== undefined) {
+    try {
+      return JSON.parse(fenceMatch[1].trim()) as unknown;
+    } catch {}
+  }
+
+  const lastBrace = text.lastIndexOf("}");
+  if (lastBrace === -1) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = lastBrace; i >= 0; i -= 1) {
+    const char = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (char === "\\") {
+      escape = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (char === "}") {
+      depth += 1;
+    } else if (char === "{") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(i, lastBrace + 1)) as unknown;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function tryParseGrokStdout(raw: string): unknown | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  try {
+    return JSON.parse(jsonrepair(trimmed)) as unknown;
+  } catch {}
+
+  let envelope: unknown = trimmed;
+  try {
+    envelope = JSON.parse(trimmed) as unknown;
+  } catch {
+    try {
+      envelope = JSON.parse(jsonrepair(trimmed)) as unknown;
+    } catch {}
+  }
+  const text = grokEnvelopeText(envelope);
+  if (text !== null) {
+    const candidates = [extractJson(text), extractLastJson(text)].filter(
+      (candidate): candidate is unknown => candidate !== null,
+    );
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      if (isPlausibleGrokResult(candidates[i])) {
+        return candidates[i];
+      }
+    }
+    const rootKeys = ["findings", "summary", "outcome"];
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      const candidate = candidates[i];
+      if (
+        typeof candidate === "object" &&
+        candidate !== null &&
+        rootKeys.some((key) => key in candidate)
+      ) {
+        return candidate;
+      }
+    }
+    if (candidates.length > 0) {
+      return candidates[candidates.length - 1]!;
+    }
+    try {
+      return JSON.parse(jsonrepair(text)) as unknown;
+    } catch {}
+  }
+  return isPlausibleGrokResult(envelope) ? envelope : null;
+}
+
+export function unwrapGrokEnvelope(raw: string): string {
+  try {
+    const outer = JSON.parse(raw) as unknown;
+    const text = grokEnvelopeText(outer);
+    return text ?? raw;
+  } catch {
+    return raw;
+  }
+}
+
+export function normalizeGrokOutput(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const normalized = structuredClone(value) as Record<string, unknown>;
+  const findings = normalized["findings"];
+  if (Array.isArray(findings)) {
+    for (const finding of findings) {
+      if (typeof finding !== "object" || finding === null) {
+        continue;
+      }
+      const record = finding as Record<string, unknown>;
+      const category = record["category"];
+      if (typeof category === "string") {
+        const normalizedCategory = normalizeCategory(category);
+        record["category"] = normalizedCategory;
+        if (normalizedCategory !== category) {
+          record["originalCategory"] = category;
+        }
+      }
+      const severity = record["severity"];
+      if (typeof severity === "string") {
+        record["severity"] = normalizeSeverity(severity);
+      }
+      const confidence = record["confidence"];
+      if (typeof confidence === "string") {
+        record["confidence"] = normalizeConfidence(confidence);
+      }
+    }
+  }
+  const risk = normalized["risk"];
+  if (typeof risk === "string") {
+    normalized["risk"] = normalizeRisk(risk);
+  }
+  const outcome = normalized["outcome"];
+  if (typeof outcome === "string") {
+    normalized["outcome"] = normalizeOutcome(outcome);
+  }
+  return normalized;
+}
+
+const ALLOWED_CATEGORIES = new Set<string>(findingCategories as readonly string[]);
+
+const CATEGORY_ALIASES: Record<string, string> = {
+  "api contract": "api-contract",
+  authorization: "security",
+  auth: "security",
+  bottleneck: "performance",
+  "build failure": "build-release",
+  ci: "build-release",
+  "data corruption": "data-loss",
+  "data loss": "data-loss",
+  deadlock: "concurrency",
+  docstring: "docs-gap",
+  fork: "concurrency",
+  "high latency": "performance",
+  "inconsistent data": "data-loss",
+  injection: "security",
+  "interface mismatch": "api-contract",
+  "lost update": "data-loss",
+  multiprocessing: "concurrency",
+  "no test": "test-gap",
+  packaging: "build-release",
+  "parallelism issue": "concurrency",
+  permission: "security",
+  "process pool": "concurrency",
+  race: "concurrency",
+  "race condition": "concurrency",
+  "schema violation": "api-contract",
+  "security issue": "security",
+  slow: "performance",
+  "spawn context": "concurrency",
+  "state corruption": "data-loss",
+  "test coverage": "test-gap",
+  "thread safety": "concurrency",
+  "type mismatch": "api-contract",
+  untested: "test-gap",
+  vulnerability: "security",
+};
+
+const CATEGORY_KEYWORD_RULES: Array<{ keywords: string[]; target: string }> = [
+  {
+    keywords: [
+      "concurr",
+      "parallel",
+      "thread",
+      "deadlock",
+      "race cond",
+      "spawn",
+      "multiprocess",
+      "fork",
+      "process pool",
+    ],
+    target: "concurrency",
+  },
+  {
+    keywords: ["perform", "slow", "inefficien", "bottleneck", "latenc", "cpu intens", "memory"],
+    target: "performance",
+  },
+  {
+    keywords: ["secur", "vulnerab", "inject", "auth", "permis", "exploit", "xss", "csrf"],
+    target: "security",
+  },
+  {
+    keywords: ["data loss", "corrupt", "inconsist", "lost data", "state corruption"],
+    target: "data-loss",
+  },
+  { keywords: ["test", "coverage", "untested", "no test"], target: "test-gap" },
+  { keywords: ["doc", "readme", "comment", "docstring"], target: "docs-gap" },
+  { keywords: ["api", "contract", "interface", "schema", "type mismatch"], target: "api-contract" },
+  { keywords: ["build", "ci", "release", "packag", "deploy", "lint"], target: "build-release" },
+  {
+    keywords: ["maintain", "readab", "complex", "debt", "duplicat", "style", "clarity"],
+    target: "maintainability",
+  },
+  { keywords: ["bug", "incorrect", "wrong", "error", "fault", "logic", "off-by"], target: "bug" },
+];
+
+export function normalizeCategory(raw: string): string {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  if (ALLOWED_CATEGORIES.has(trimmed)) {
+    return trimmed;
+  }
+  if (ALLOWED_CATEGORIES.has(lower)) {
+    return lower;
+  }
+  const alias = CATEGORY_ALIASES[lower];
+  if (alias !== undefined) {
+    return alias;
+  }
+  for (const rule of CATEGORY_KEYWORD_RULES) {
+    if (rule.keywords.some((keyword) => lower.includes(keyword))) {
+      return rule.target;
+    }
+  }
+  return "maintainability";
+}
+
+export function normalizeSeverity(raw: string): string {
+  const lower = raw.toLowerCase().trim();
+  if (["critical", "high", "medium", "low"].includes(lower)) {
+    return lower;
+  }
+  if (["severe", "crit", "fatal"].includes(lower)) {
+    return "critical";
+  }
+  if (["med", "moderate"].includes(lower)) {
+    return "medium";
+  }
+  if (["minor", "trivial"].includes(lower)) {
+    return "low";
+  }
+  return "medium";
+}
+
+export function normalizeConfidence(raw: string): string {
+  const lower = raw.toLowerCase().trim();
+  if (["high", "medium", "low"].includes(lower)) {
+    return lower;
+  }
+  if (["certain", "sure", "strong"].includes(lower)) {
+    return "high";
+  }
+  if (["med", "moderate"].includes(lower)) {
+    return "medium";
+  }
+  if (["weak", "unsure", "guess"].includes(lower)) {
+    return "low";
+  }
+  return "medium";
+}
+
+export function normalizeRisk(raw: string): string {
+  const lower = raw.toLowerCase().trim();
+  if (["low", "medium", "high"].includes(lower)) {
+    return lower;
+  }
+  if (["safe", "trivial"].includes(lower)) {
+    return "low";
+  }
+  if (["risky", "dangerous"].includes(lower)) {
+    return "high";
+  }
+  return "medium";
+}
+
+export function normalizeOutcome(raw: string): string {
+  const lower = raw.toLowerCase().trim();
+  if (["fixed", "open", "false-positive", "uncertain"].includes(lower)) {
+    return lower;
+  }
+  if (["resolved", "done"].includes(lower)) {
+    return "fixed";
+  }
+  if (["false positive", "fp", "not a bug"].includes(lower)) {
+    return "false-positive";
+  }
+  if (["unsure", "unknown"].includes(lower)) {
+    return "uncertain";
+  }
+  return "open";
+}
+
 function providerExitCode(stderr: string): number {
-  if (/auth|login|api key|unauthorized|wrong api key/iu.test(stderr)) {
+  if (/auth|login|api key|GROK_CODE_XAI|xai-|unauthorized|wrong api key/iu.test(stderr)) {
     return 4;
   }
   if (/quota|rate.?limit/iu.test(stderr)) {

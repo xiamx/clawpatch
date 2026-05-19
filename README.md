@@ -95,16 +95,19 @@ Deeper framework mappers and agent-assisted enrichment are next steps.
 
 ## Provider
 
-The default provider is the local Codex CLI.
+The default provider is the local Codex CLI. A `grok` provider is also available for the official xAI Grok Build CLI.
 
 ```bash
-codex --version
+codex --version   # or: grok --version / grok inspect
 clawpatch doctor
 ```
 
-Provider calls use `codex exec` with strict JSON schemas. Review and revalidate
-run read-only; fix planning runs with workspace-write because Codex may edit the
-working tree during the explicit fix command.
+Provider calls use the local CLI agent:
+
+- `codex`: `codex exec` + `--sandbox` + `--output-schema` + `--output-last-message` (clean file channel)
+- `grok`: `grok --prompt-file ... --output-format json` (file-write instruction is primary; stdout + jsonrepair is fallback)
+
+Review and revalidate run in a read-only / analysis mode; fix planning allows the agent to edit the working tree.
 
 Set `CLAWPATCH_CODEX_SANDBOX` to override the Codex sandbox passed by
 Clawpatch. Use any Codex sandbox mode, or `bypass`/`none` to pass
@@ -113,9 +116,9 @@ provides isolation.
 
 Supported provider names today:
 
-- `codex`: local Codex CLI
+- `codex`: local Codex CLI (recommended — strongest structured output guarantees)
 - `acpx`: any ACP-compatible coding agent (Codex / Claude / Pi / Gemini / ...) via openclaw/acpx
-- `grok`: local Grok Build CLI
+- `grok`: local Grok Build / xAI CLI (requires `grok` binary + `GROK_CODE_XAI_API_KEY` or `grok login`)
 - `opencode`: local OpenCode CLI
 - `mock`: deterministic test provider
 - `mock-fail`: failure test provider
